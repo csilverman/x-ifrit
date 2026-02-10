@@ -32,6 +32,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         exit;
     }
     
+    // Validate deadline format (YYYY-MM-DD)
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $newDeadline)) {
+        echo json_encode(['success' => false, 'error' => 'Invalid deadline format']);
+        exit;
+    }
+    
     // Security: prevent path traversal
     $file = basename($file);
     $filePath = $DATA_DIR . '/' . $file;
@@ -44,10 +50,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     try {
         // Step A: Read the JSON file
         $jsonData = file_get_contents($filePath);
+        if ($jsonData === false) {
+            throw new Exception('Failed to read file');
+        }
+        
         $data = json_decode($jsonData, true);
         
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new Exception('Failed to parse JSON: ' . json_last_error_msg());
+        }
+        
         if (!is_array($data)) {
-            throw new Exception('Invalid JSON data');
+            throw new Exception('Expected JSON object, got ' . gettype($data));
         }
         
         // Extract ID from filename using regex
@@ -66,22 +80,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         // Step B: Modify status to "rescheduled"
         $data['status'] = 'rescheduled';
         
-        // Step C: Save and rename with -depr suffix
+        // Step C: Write directly to the deprecated filename (atomic operation)
         $deprFile = $itemId . $separator . $oldDate . '-depr.json';
         $deprPath = $DATA_DIR . '/' . $deprFile;
         
-        file_put_contents($filePath, json_encode($data, JSON_PRETTY_PRINT));
-        rename($filePath, $deprPath);
+        if (!file_put_contents($deprPath, json_encode($data, JSON_PRETTY_PRINT))) {
+            throw new Exception('Failed to write deprecated file');
+        }
+        
+        // Remove the original file now that deprecated version is created
+        if (file_exists($filePath)) {
+            unlink($filePath);
+        }
         
         // Step D: Create duplicate with new deadline and -updateMe suffix
-        // Remove the "rescheduled" status for the new file
-        unset($data['status']);
-        $data['deadline'] = $newDeadline;
-        
+        // Check if the new file already exists to prevent overwriting
         $newFile = $itemId . $separator . $newDeadline . '-updateMe.json';
         $newPath = $DATA_DIR . '/' . $newFile;
         
-        file_put_contents($newPath, json_encode($data, JSON_PRETTY_PRINT));
+        if (file_exists($newPath)) {
+            throw new Exception('A file with the new deadline already exists');
+        }
+        
+        // Prepare data for new file: remove rescheduled status and update deadline
+        unset($data['status']);
+        $data['deadline'] = $newDeadline;
+        
+        if (!file_put_contents($newPath, json_encode($data, JSON_PRETTY_PRINT))) {
+            throw new Exception('Failed to write new file');
+        }
         
         echo json_encode(['success' => true]);
         exit;
@@ -1099,7 +1126,8 @@ $monthNames = [
             // Get the day of week (0 = Sunday, 1 = Monday, etc.)
             const dayOfWeek = date.getDay();
             
-            // If it's not Monday, find the next Monday
+            // Find the Monday on or after this date
+            // If already Monday (1), use it; otherwise find the next Monday
             if (dayOfWeek !== 1) {
                 // Calculate days until next Monday
                 const daysUntilMonday = dayOfWeek === 0 ? 1 : (8 - dayOfWeek);
