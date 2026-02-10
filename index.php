@@ -38,9 +38,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         exit;
     }
     
-    // Security: prevent path traversal
-    $file = basename($file);
+    // Security: prevent path traversal - allow one level subdirectory
+    $file = str_replace(['../', '..\\'], '', $file);
     $filePath = $DATA_DIR . '/' . $file;
+    
+    // Ensure the file exists and is within the data directory
+    $realPath = realpath($filePath);
+    $realDataDir = realpath($DATA_DIR);
+    
+    if (!$realPath || !$realDataDir || strpos($realPath, $realDataDir) !== 0) {
+        echo json_encode(['success' => false, 'error' => 'File not found or invalid path']);
+        exit;
+    }
     
     if (!file_exists($filePath)) {
         echo json_encode(['success' => false, 'error' => 'File not found']);
@@ -67,7 +76,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         // Extract ID from filename using regex
         // Pattern supports both formats: ID-YYYY-MM-DD[-suffix].json and ID___YYYY-MM-DD[-suffix].json
         $pattern = '/^(.+?)(?:___|-)(\d{4}-\d{2}-\d{2})(?:-[a-zA-Z]+)?\.json$/';
-        if (!preg_match($pattern, $file, $matches)) {
+        $basename = basename($file);
+        if (!preg_match($pattern, $basename, $matches)) {
             throw new Exception('Invalid filename format');
         }
         
@@ -75,14 +85,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $oldDate = $matches[2];
         
         // Detect separator used in original filename
-        $separator = (strpos($file, '___') !== false) ? '___' : '-';
+        $separator = (strpos($basename, '___') !== false) ? '___' : '-';
+        
+        // Get directory path (preserve subdirectory structure)
+        $fileDir = dirname($filePath);
         
         // Step B: Modify status to "rescheduled"
         $data['status'] = 'rescheduled';
         
         // Step C: Write directly to the deprecated filename (atomic operation)
         $deprFile = $itemId . $separator . $oldDate . '-depr.json';
-        $deprPath = $DATA_DIR . '/' . $deprFile;
+        $deprPath = $fileDir . '/' . $deprFile;
         
         if (!file_put_contents($deprPath, json_encode($data, JSON_PRETTY_PRINT))) {
             throw new Exception('Failed to write deprecated file');
@@ -96,7 +109,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         // Step D: Create duplicate with new deadline and -updateMe suffix
         // Check if the new file already exists to prevent overwriting
         $newFile = $itemId . $separator . $newDeadline . '-updateMe.json';
-        $newPath = $DATA_DIR . '/' . $newFile;
+        $newPath = $fileDir . '/' . $newFile;
         
         if (file_exists($newPath)) {
             throw new Exception('A file with the new deadline already exists');
@@ -108,6 +121,76 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         
         if (!file_put_contents($newPath, json_encode($data, JSON_PRETTY_PRINT))) {
             throw new Exception('Failed to write new file');
+        }
+        
+        echo json_encode(['success' => true]);
+        exit;
+        
+    } catch (Exception $e) {
+        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        exit;
+    }
+}
+
+// -------------------- ADD ITEM ENDPOINT --------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'additem') {
+    header('Content-Type: application/json');
+    
+    $program = $_POST['program'] ?? '';
+    $deadline = $_POST['deadline'] ?? '';
+    $name = $_POST['name'] ?? '';
+    
+    if (empty($program) || empty($deadline) || empty($name)) {
+        echo json_encode(['success' => false, 'error' => 'Missing required fields']);
+        exit;
+    }
+    
+    // Validate deadline format (YYYY-MM-DD)
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $deadline)) {
+        echo json_encode(['success' => false, 'error' => 'Invalid deadline format']);
+        exit;
+    }
+    
+    // Security: sanitize program name (prevent path traversal)
+    $program = basename($program);
+    if (empty($program) || $program === '.' || $program === '..') {
+        echo json_encode(['success' => false, 'error' => 'Invalid program name']);
+        exit;
+    }
+    
+    try {
+        // Ensure the program directory exists
+        $programDir = $DATA_DIR . '/' . $program;
+        if (!is_dir($programDir)) {
+            if (!mkdir($programDir, 0755, true)) {
+                throw new Exception('Failed to create program directory');
+            }
+        }
+        
+        // Generate filename: {timestamp}___YYYY-MM-DD-importMe.json
+        $timestamp = time();
+        $filename = $timestamp . '___' . $deadline . '-importMe.json';
+        $filePath = $programDir . '/' . $filename;
+        
+        // Check if file already exists
+        if (file_exists($filePath)) {
+            throw new Exception('File already exists');
+        }
+        
+        // Create JSON data
+        $data = [
+            'status' => 'notDone',
+            'id' => 'tmp',
+            'integrity' => 'notLate',
+            'program' => $program,
+            'deadline' => $deadline,
+            'name' => $name,
+            'tags' => 'wobj'
+        ];
+        
+        // Write the file
+        if (!file_put_contents($filePath, json_encode($data, JSON_PRETTY_PRINT))) {
+            throw new Exception('Failed to write file');
         }
         
         echo json_encode(['success' => true]);
@@ -186,6 +269,7 @@ $currentWeek  = $isThisYear ? week_bucket_1_to_4((int)$now->format('j')) : null;
 
 // -------------------- LOAD ITEMS --------------------
 $items = []; // items[month][week] = list of items
+$allPrograms = []; // collect unique programs
 
 for ($m = 1; $m <= 12; $m++) {
     for ($w = 1; $w <= 4; $w++) {
@@ -197,7 +281,12 @@ $errors = [];
 if (!is_dir($DATA_DIR)) {
     $errors[] = "Data directory not found: {$DATA_DIR}";
 } else {
-    $files = glob($DATA_DIR . '/*.json') ?: [];
+    // Scan both top-level and subdirectories for JSON files
+    $files = array_merge(
+        glob($DATA_DIR . '/*.json') ?: [],
+        glob($DATA_DIR . '/*/*.json') ?: []
+    );
+    
     foreach ($files as $file) {
         $raw = @file_get_contents($file);
         if ($raw === false) {
@@ -209,6 +298,11 @@ if (!is_dir($DATA_DIR)) {
         if (!is_array($data)) {
             $errors[] = "Invalid JSON: " . basename($file);
             continue;
+        }
+
+        // Collect program names
+        if (isset($data['program']) && !empty($data['program'])) {
+            $allPrograms[$data['program']] = true;
         }
 
         $dt = parse_deadline_to_datetime($data['deadline'] ?? null);
@@ -226,15 +320,22 @@ if (!is_dir($DATA_DIR)) {
 
         $title = $data['title'] ?? $data['name'] ?? safe_basename_no_ext($file);
 
+        // Get relative file path (including subdirectory)
+        $relativeFile = str_replace($DATA_DIR . '/', '', $file);
+
         // Keep anything else you want to display
         $items[$month][$week][] = [
             'title'    => (string)$title,
-            'file'     => basename($file),
+            'file'     => $relativeFile,
             'deadline' => $dt->format('Y-m-d'),
             'raw'      => $data,
         ];
     }
 }
+
+// Sort and convert programs to array
+$allPrograms = array_keys($allPrograms);
+sort($allPrograms);
 
 // Optional: sort items inside each bucket by deadline then title
 for ($m = 1; $m <= 12; $m++) {
@@ -817,6 +918,116 @@ $monthNames = [
             opacity: 1;
         }
     }
+
+    /* =========================
+       ADD ITEM BUTTON
+       ========================= */
+    
+    .add-item-btn {
+        margin-top: 8px;
+        padding: 4px 8px;
+        font-size: 11px;
+        border-radius: 8px;
+        cursor: pointer;
+        width: 100%;
+        transition: all 0.2s;
+        background: rgba(34, 197, 94, 0.08) !important;
+        border: 1px solid rgba(34, 197, 94, 0.25) !important;
+        color: #166534 !important;
+    }
+
+    .add-item-btn:hover {
+        background: rgba(34, 197, 94, 0.15) !important;
+        border-color: rgba(34, 197, 94, 0.35) !important;
+    }
+
+    /* =========================
+       ADD ITEM MODAL
+       ========================= */
+    
+    .add-item-modal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.5);
+        z-index: 1000;
+        justify-content: center;
+        align-items: center;
+    }
+
+    .add-item-modal.active {
+        display: flex;
+    }
+
+    .add-item-box {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 20px;
+        max-width: 400px;
+        width: 90%;
+        box-shadow: var(--shadow);
+    }
+
+    .add-item-box h3 {
+        margin: 0 0 16px 0;
+        font-size: 16px;
+        font-weight: 700;
+    }
+
+    .add-item-form-group {
+        margin-bottom: 16px;
+    }
+
+    .add-item-form-group label {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        margin-bottom: 6px;
+        color: var(--muted);
+    }
+
+    .add-item-form-group select,
+    .add-item-form-group input {
+        width: 100%;
+        padding: 8px 10px;
+        font-size: 13px;
+        border-radius: 8px;
+    }
+
+    .add-item-actions {
+        display: flex;
+        gap: 10px;
+        margin-top: 20px;
+    }
+
+    .add-item-actions button {
+        flex: 1;
+        padding: 10px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        border-radius: 8px;
+        transition: all 0.2s;
+    }
+
+    .add-item-confirm {
+        background: rgba(34, 197, 94, 0.15) !important;
+        border-color: rgba(34, 197, 94, 0.35) !important;
+        color: #166534 !important;
+    }
+
+    .add-item-confirm:hover {
+        background: rgba(34, 197, 94, 0.25) !important;
+    }
+
+    .add-item-cancel:hover {
+        background: rgba(220, 38, 38, 0.12) !important;
+        border-color: rgba(220, 38, 38, 0.35) !important;
+    }
     </style>
 </head>
 
@@ -1022,6 +1233,7 @@ $monthNames = [
                                 </div>
                                 <?php endforeach; ?>
                                 <?php endif; ?>
+                                <button class="add-item-btn" data-month="<?=h($m)?>" data-week="<?=h($w)?>">+ Add</button>
                             </div>
                         </div>
                         <?php endfor; ?>
@@ -1088,8 +1300,59 @@ $monthNames = [
     <!-- Message Toast -->
     <div class="reschedule-message" id="rescheduleMessage"></div>
 
+    <!-- Add Item Modal -->
+    <div class="add-item-modal" id="addItemModal">
+        <div class="add-item-box">
+            <h3>Add New Item</h3>
+            <div class="add-item-form-group">
+                <label for="add-item-month">Month</label>
+                <select id="add-item-month">
+                    <option value="1">January</option>
+                    <option value="2">February</option>
+                    <option value="3">March</option>
+                    <option value="4">April</option>
+                    <option value="5">May</option>
+                    <option value="6">June</option>
+                    <option value="7">July</option>
+                    <option value="8">August</option>
+                    <option value="9">September</option>
+                    <option value="10">October</option>
+                    <option value="11">November</option>
+                    <option value="12">December</option>
+                </select>
+            </div>
+            <div class="add-item-form-group">
+                <label for="add-item-week">Week</label>
+                <select id="add-item-week">
+                    <option value="1">Week 1 (1–7)</option>
+                    <option value="2">Week 2 (8–14)</option>
+                    <option value="3">Week 3 (15–21)</option>
+                    <option value="4">Week 4 (22–end)</option>
+                </select>
+            </div>
+            <div class="add-item-form-group">
+                <label for="add-item-program">Program</label>
+                <select id="add-item-program">
+                    <?php foreach ($allPrograms as $prog): ?>
+                    <option value="<?=h($prog)?>"><?=h($prog)?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="add-item-form-group">
+                <label for="add-item-name">Name</label>
+                <input type="text" id="add-item-name" placeholder="Enter item name" />
+            </div>
+            <div class="add-item-actions">
+                <button class="add-item-cancel" id="add-item-cancel">Cancel</button>
+                <button class="add-item-confirm" id="add-item-confirm">Add Item</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Reschedule JavaScript -->
     <script>
+    const allPrograms = <?=json_encode($allPrograms)?>;
+    
     (function() {
         const modal = document.getElementById('rescheduleModal');
         const monthSelect = document.getElementById('reschedule-month');
@@ -1217,6 +1480,167 @@ $monthNames = [
 
         cancelBtn.addEventListener('click', closeModal);
         confirmBtn.addEventListener('click', handleReschedule);
+
+        // Close on Escape key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && modal.classList.contains('active')) {
+                closeModal();
+            }
+        });
+    })();
+
+    // ==================== ADD ITEM MODAL ====================
+    (function() {
+        const modal = document.getElementById('addItemModal');
+        const monthSelect = document.getElementById('add-item-month');
+        const weekSelect = document.getElementById('add-item-week');
+        const programSelect = document.getElementById('add-item-program');
+        const nameInput = document.getElementById('add-item-name');
+        const confirmBtn = document.getElementById('add-item-confirm');
+        const cancelBtn = document.getElementById('add-item-cancel');
+        const messageEl = document.getElementById('rescheduleMessage');
+        
+        const currentYear = <?=json_encode($year)?>;
+
+        // Show message toast
+        function showMessage(text, type = 'success') {
+            messageEl.textContent = text;
+            messageEl.className = 'reschedule-message show ' + type;
+            setTimeout(() => {
+                messageEl.className = 'reschedule-message';
+            }, 4000);
+        }
+
+        // Calculate Monday of week
+        function getMondayOfWeek(year, month, week) {
+            let startDay;
+            switch(week) {
+                case 1: startDay = 1; break;
+                case 2: startDay = 8; break;
+                case 3: startDay = 15; break;
+                case 4: startDay = 22; break;
+            }
+            
+            // Create date for the start day of the week bucket
+            const date = new Date(year, month - 1, startDay);
+            
+            // Get the day of week (0 = Sunday, 1 = Monday, etc.)
+            const dayOfWeek = date.getDay();
+            
+            // Find the Monday on or after this date
+            if (dayOfWeek !== 1) {
+                // Calculate days until next Monday
+                const daysUntilMonday = dayOfWeek === 0 ? 1 : (8 - dayOfWeek);
+                date.setDate(date.getDate() + daysUntilMonday);
+            }
+            
+            return date;
+        }
+
+        // Calculate deadline (Sunday after the week's Monday)
+        function getDeadline(mondayDate) {
+            const deadline = new Date(mondayDate);
+            deadline.setDate(deadline.getDate() + 6);
+            return deadline;
+        }
+
+        // Format date as YYYY-MM-DD
+        function formatDate(date) {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        }
+
+        // Open modal
+        function openModal(month, week) {
+            monthSelect.value = month;
+            weekSelect.value = week;
+            nameInput.value = '';
+            // Set first program as default if available
+            if (programSelect.options.length > 0) {
+                programSelect.selectedIndex = 0;
+            }
+            modal.classList.add('active');
+            nameInput.focus();
+        }
+
+        // Close modal
+        function closeModal() {
+            modal.classList.remove('active');
+        }
+
+        // Handle add item
+        async function handleAddItem() {
+            const month = parseInt(monthSelect.value);
+            const week = parseInt(weekSelect.value);
+            const program = programSelect.value;
+            const name = nameInput.value.trim();
+
+            if (!name) {
+                showMessage('Please enter an item name', 'error');
+                return;
+            }
+
+            if (!program) {
+                showMessage('Please select a program', 'error');
+                return;
+            }
+
+            // Calculate deadline
+            const monday = getMondayOfWeek(currentYear, month, week);
+            const deadline = getDeadline(monday);
+            const deadlineStr = formatDate(deadline);
+
+            try {
+                const response = await fetch(window.location.pathname, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: `action=additem&program=${encodeURIComponent(program)}&deadline=${encodeURIComponent(deadlineStr)}&name=${encodeURIComponent(name)}`
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showMessage('Item added successfully! Reloading...', 'success');
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 1500);
+                } else {
+                    showMessage('Error: ' + (result.error || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                showMessage('Error: ' + error.message, 'error');
+            }
+
+            closeModal();
+        }
+
+        // Event listeners
+        document.addEventListener('click', (e) => {
+            if (e.target.classList.contains('add-item-btn')) {
+                const month = e.target.dataset.month;
+                const week = e.target.dataset.week;
+                openModal(month, week);
+            }
+
+            // Close on backdrop click
+            if (e.target === modal) {
+                closeModal();
+            }
+        });
+
+        cancelBtn.addEventListener('click', closeModal);
+        confirmBtn.addEventListener('click', handleAddItem);
+
+        // Handle Enter key in name input
+        nameInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                handleAddItem();
+            }
+        });
 
         // Close on Escape key
         document.addEventListener('keydown', (e) => {
