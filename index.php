@@ -1396,15 +1396,15 @@ $monthNames = [
             const dayOfWeek = date.getDay();
             
             // Find the Monday on or after this date
-            // If already Monday (1), use it; otherwise find the next Monday
             if (dayOfWeek === 0) {
                 // Sunday -> add 1 day to get Monday
                 date.setDate(date.getDate() + 1);
             } else if (dayOfWeek !== 1) {
-                // Not Monday -> calculate days until next Monday
-                const daysUntilMonday = (8 - dayOfWeek) % 7;
+                // Tuesday-Saturday -> calculate days until next Monday
+                const daysUntilMonday = 8 - dayOfWeek;
                 date.setDate(date.getDate() + daysUntilMonday);
             }
+            // If dayOfWeek === 1 (Monday), no change needed
             
             return date;
         }
@@ -1537,15 +1537,15 @@ $monthNames = [
             const dayOfWeek = date.getDay();
             
             // Find the Monday on or after this date
-            // If already Monday (1), use it; otherwise find the next Monday
             if (dayOfWeek === 0) {
                 // Sunday -> add 1 day to get Monday
                 date.setDate(date.getDate() + 1);
             } else if (dayOfWeek !== 1) {
-                // Not Monday -> calculate days until next Monday
-                const daysUntilMonday = (8 - dayOfWeek) % 7;
+                // Tuesday-Saturday -> calculate days until next Monday
+                const daysUntilMonday = 8 - dayOfWeek;
                 date.setDate(date.getDate() + daysUntilMonday);
             }
+            // If dayOfWeek === 1 (Monday), no change needed
             
             return date;
         }
