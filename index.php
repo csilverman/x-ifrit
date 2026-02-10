@@ -38,9 +38,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         exit;
     }
     
-    // Security: prevent path traversal - allow one level subdirectory
-    $file = str_replace(['../', '..\\'], '', $file);
-    $filePath = $DATA_DIR . '/' . $file;
+    // Security: prevent path traversal - validate subdirectory structure
+    // Extract subdirectory and filename
+    $fileParts = explode('/', str_replace('\\', '/', $file));
+    
+    // Should be in format: subdirectory/filename.json (max 2 parts)
+    if (count($fileParts) !== 2) {
+        echo json_encode(['success' => false, 'error' => 'Invalid file path format']);
+        exit;
+    }
+    
+    $subdir = basename($fileParts[0]);
+    $filename = basename($fileParts[1]);
+    
+    // Reconstruct safe path
+    $filePath = $DATA_DIR . '/' . $subdir . '/' . $filename;
     
     // Ensure the file exists and is within the data directory
     $realPath = realpath($filePath);
@@ -48,11 +60,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     
     if (!$realPath || !$realDataDir || strpos($realPath, $realDataDir) !== 0) {
         echo json_encode(['success' => false, 'error' => 'File not found or invalid path']);
-        exit;
-    }
-    
-    if (!file_exists($filePath)) {
-        echo json_encode(['success' => false, 'error' => 'File not found']);
         exit;
     }
     
@@ -172,12 +179,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $filename = $timestamp . '___' . $deadline . '-importMe.json';
         $filePath = $programDir . '/' . $filename;
         
-        // Check if file already exists
+        // Check if file already exists (should be extremely rare due to timestamp)
         if (file_exists($filePath)) {
-            throw new Exception('File already exists');
+            throw new Exception('Unable to create item - a conflict was detected. Please try again.');
         }
         
         // Create JSON data
+        // Note: 'id' is set to 'tmp' as a placeholder; it will be updated by downstream processing
         $data = [
             'status' => 'notDone',
             'id' => 'tmp',
@@ -1351,8 +1359,6 @@ $monthNames = [
 
     <!-- Reschedule JavaScript -->
     <script>
-    const allPrograms = <?=json_encode($allPrograms)?>;
-    
     (function() {
         const modal = document.getElementById('rescheduleModal');
         const monthSelect = document.getElementById('reschedule-month');
@@ -1391,9 +1397,12 @@ $monthNames = [
             
             // Find the Monday on or after this date
             // If already Monday (1), use it; otherwise find the next Monday
-            if (dayOfWeek !== 1) {
-                // Calculate days until next Monday
-                const daysUntilMonday = dayOfWeek === 0 ? 1 : (8 - dayOfWeek);
+            if (dayOfWeek === 0) {
+                // Sunday -> add 1 day to get Monday
+                date.setDate(date.getDate() + 1);
+            } else if (dayOfWeek !== 1) {
+                // Not Monday -> calculate days until next Monday
+                const daysUntilMonday = (8 - dayOfWeek) % 7;
                 date.setDate(date.getDate() + daysUntilMonday);
             }
             
@@ -1528,9 +1537,13 @@ $monthNames = [
             const dayOfWeek = date.getDay();
             
             // Find the Monday on or after this date
-            if (dayOfWeek !== 1) {
-                // Calculate days until next Monday
-                const daysUntilMonday = dayOfWeek === 0 ? 1 : (8 - dayOfWeek);
+            // If already Monday (1), use it; otherwise find the next Monday
+            if (dayOfWeek === 0) {
+                // Sunday -> add 1 day to get Monday
+                date.setDate(date.getDate() + 1);
+            } else if (dayOfWeek !== 1) {
+                // Not Monday -> calculate days until next Monday
+                const daysUntilMonday = (8 - dayOfWeek) % 7;
                 date.setDate(date.getDate() + daysUntilMonday);
             }
             
