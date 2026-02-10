@@ -20,6 +20,105 @@ date_default_timezone_set('America/New_York');
 // -------------------- CONFIG --------------------
 $DATA_DIR = __DIR__ . '/data'; // folder containing .json files
 
+// -------------------- RESCHEDULE ENDPOINT --------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'reschedule') {
+    header('Content-Type: application/json');
+    
+    $file = $_POST['file'] ?? '';
+    $newDeadline = $_POST['deadline'] ?? '';
+    
+    if (empty($file) || empty($newDeadline)) {
+        echo json_encode(['success' => false, 'error' => 'Missing file or deadline']);
+        exit;
+    }
+    
+    // Validate deadline format (YYYY-MM-DD)
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $newDeadline)) {
+        echo json_encode(['success' => false, 'error' => 'Invalid deadline format']);
+        exit;
+    }
+    
+    // Security: prevent path traversal
+    $file = basename($file);
+    $filePath = $DATA_DIR . '/' . $file;
+    
+    if (!file_exists($filePath)) {
+        echo json_encode(['success' => false, 'error' => 'File not found']);
+        exit;
+    }
+    
+    try {
+        // Step A: Read the JSON file
+        $jsonData = file_get_contents($filePath);
+        if ($jsonData === false) {
+            throw new Exception('Failed to read file');
+        }
+        
+        $data = json_decode($jsonData, true);
+        
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new Exception('Failed to parse JSON: ' . json_last_error_msg());
+        }
+        
+        if (!is_array($data)) {
+            throw new Exception('Expected JSON object, got ' . gettype($data));
+        }
+        
+        // Extract ID from filename using regex
+        // Pattern supports both formats: ID-YYYY-MM-DD[-suffix].json and ID___YYYY-MM-DD[-suffix].json
+        $pattern = '/^(.+?)(?:___|-)(\d{4}-\d{2}-\d{2})(?:-[a-zA-Z]+)?\.json$/';
+        if (!preg_match($pattern, $file, $matches)) {
+            throw new Exception('Invalid filename format');
+        }
+        
+        $itemId = $matches[1];
+        $oldDate = $matches[2];
+        
+        // Detect separator used in original filename
+        $separator = (strpos($file, '___') !== false) ? '___' : '-';
+        
+        // Step B: Modify status to "rescheduled"
+        $data['status'] = 'rescheduled';
+        
+        // Step C: Write directly to the deprecated filename (atomic operation)
+        $deprFile = $itemId . $separator . $oldDate . '-depr.json';
+        $deprPath = $DATA_DIR . '/' . $deprFile;
+        
+        if (!file_put_contents($deprPath, json_encode($data, JSON_PRETTY_PRINT))) {
+            throw new Exception('Failed to write deprecated file');
+        }
+        
+        // Remove the original file now that deprecated version is created
+        if (file_exists($filePath)) {
+            unlink($filePath);
+        }
+        
+        // Step D: Create duplicate with new deadline and -updateMe suffix
+        // Check if the new file already exists to prevent overwriting
+        $newFile = $itemId . $separator . $newDeadline . '-updateMe.json';
+        $newPath = $DATA_DIR . '/' . $newFile;
+        
+        if (file_exists($newPath)) {
+            throw new Exception('A file with the new deadline already exists');
+        }
+        
+        // Prepare data for new file: remove rescheduled status and update deadline
+        unset($data['status']);
+        $data['deadline'] = $newDeadline;
+        
+        if (!file_put_contents($newPath, json_encode($data, JSON_PRETTY_PRINT))) {
+            throw new Exception('Failed to write new file');
+        }
+        
+        echo json_encode(['success' => true]);
+        exit;
+        
+    } catch (Exception $e) {
+        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        exit;
+    }
+}
+
 // Year to render (defaults to current year)
 $year = isset($_GET['year']) ? (int)$_GET['year'] : (int)date('Y');
 if ($year < 1970 || $year > 2100) {
@@ -573,6 +672,151 @@ $monthNames = [
         color: rgba(17, 24, 39, 0.85) !important;
         font-weight: 700;
     }
+
+    /* =========================
+       RESCHEDULE FEATURE
+       ========================= */
+    
+    .reschedule-btn {
+        margin-top: 8px;
+        padding: 4px 8px;
+        font-size: 11px;
+        border-radius: 8px;
+        cursor: pointer;
+        width: 100%;
+        transition: all 0.2s;
+    }
+
+    .reschedule-btn:hover {
+        background: rgba(59, 130, 246, 0.12) !important;
+        border-color: rgba(59, 130, 246, 0.35) !important;
+    }
+
+    .reschedule-modal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.5);
+        z-index: 1000;
+        justify-content: center;
+        align-items: center;
+    }
+
+    .reschedule-modal.active {
+        display: flex;
+    }
+
+    .reschedule-box {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 20px;
+        max-width: 400px;
+        width: 90%;
+        box-shadow: var(--shadow);
+    }
+
+    .reschedule-box h3 {
+        margin: 0 0 16px 0;
+        font-size: 16px;
+        font-weight: 700;
+    }
+
+    .reschedule-form-group {
+        margin-bottom: 16px;
+    }
+
+    .reschedule-form-group label {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        margin-bottom: 6px;
+        color: var(--muted);
+    }
+
+    .reschedule-form-group select {
+        width: 100%;
+        padding: 8px 10px;
+        font-size: 13px;
+        border-radius: 8px;
+    }
+
+    .reschedule-actions {
+        display: flex;
+        gap: 10px;
+        margin-top: 20px;
+    }
+
+    .reschedule-actions button {
+        flex: 1;
+        padding: 10px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        border-radius: 8px;
+        transition: all 0.2s;
+    }
+
+    .reschedule-confirm {
+        background: rgba(59, 130, 246, 0.15) !important;
+        border-color: rgba(59, 130, 246, 0.35) !important;
+        color: #1d4ed8 !important;
+    }
+
+    .reschedule-confirm:hover {
+        background: rgba(59, 130, 246, 0.25) !important;
+    }
+
+    .reschedule-cancel:hover {
+        background: rgba(220, 38, 38, 0.12) !important;
+        border-color: rgba(220, 38, 38, 0.35) !important;
+    }
+
+    .reschedule-message {
+        position: fixed;
+        top: 80px;
+        right: 20px;
+        padding: 12px 20px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        box-shadow: var(--shadow);
+        z-index: 1001;
+        display: none;
+        font-size: 13px;
+        max-width: 300px;
+    }
+
+    .reschedule-message.show {
+        display: block;
+        animation: slideIn 0.3s ease;
+    }
+
+    .reschedule-message.success {
+        border-color: rgba(34, 197, 94, 0.35);
+        background: rgba(34, 197, 94, 0.08);
+        color: #166534;
+    }
+
+    .reschedule-message.error {
+        border-color: rgba(220, 38, 38, 0.35);
+        background: rgba(220, 38, 38, 0.08);
+        color: #7f1d1d;
+    }
+
+    @keyframes slideIn {
+        from {
+            transform: translateX(400px);
+            opacity: 0;
+        }
+        to {
+            transform: translateX(0);
+            opacity: 1;
+        }
+    }
     </style>
 </head>
 
@@ -774,6 +1018,7 @@ $monthNames = [
                                         <span>📅 <?=h($it['deadline'])?></span>
                                         <span>🗂 <?=h($it['file'])?></span>
                                     </div>
+                                    <button class="reschedule-btn" data-file="<?=h($it['file'])?>">↻ Reschedule</button>
                                 </div>
                                 <?php endforeach; ?>
                                 <?php endif; ?>
@@ -802,6 +1047,185 @@ $monthNames = [
             Each file should contain a <code>"deadline"</code> field like <code>"<?=h($year)?>-03-14"</code> (ISO8601 also works).
         </div>
     </div>
+
+    <!-- Reschedule Modal -->
+    <div class="reschedule-modal" id="rescheduleModal">
+        <div class="reschedule-box">
+            <h3>Reschedule Item</h3>
+            <div class="reschedule-form-group">
+                <label for="reschedule-month">Month</label>
+                <select id="reschedule-month">
+                    <option value="1">January</option>
+                    <option value="2">February</option>
+                    <option value="3">March</option>
+                    <option value="4">April</option>
+                    <option value="5">May</option>
+                    <option value="6">June</option>
+                    <option value="7">July</option>
+                    <option value="8">August</option>
+                    <option value="9">September</option>
+                    <option value="10">October</option>
+                    <option value="11">November</option>
+                    <option value="12">December</option>
+                </select>
+            </div>
+            <div class="reschedule-form-group">
+                <label for="reschedule-week">Week</label>
+                <select id="reschedule-week">
+                    <option value="1">Week 1 (1–7)</option>
+                    <option value="2">Week 2 (8–14)</option>
+                    <option value="3">Week 3 (15–21)</option>
+                    <option value="4">Week 4 (22–end)</option>
+                </select>
+            </div>
+            <div class="reschedule-actions">
+                <button class="reschedule-cancel" id="reschedule-cancel">Cancel</button>
+                <button class="reschedule-confirm" id="reschedule-confirm">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Message Toast -->
+    <div class="reschedule-message" id="rescheduleMessage"></div>
+
+    <!-- Reschedule JavaScript -->
+    <script>
+    (function() {
+        const modal = document.getElementById('rescheduleModal');
+        const monthSelect = document.getElementById('reschedule-month');
+        const weekSelect = document.getElementById('reschedule-week');
+        const confirmBtn = document.getElementById('reschedule-confirm');
+        const cancelBtn = document.getElementById('reschedule-cancel');
+        const messageEl = document.getElementById('rescheduleMessage');
+        
+        let currentFile = null;
+        const currentYear = <?=json_encode($year)?>;
+
+        // Show message toast
+        function showMessage(text, type = 'success') {
+            messageEl.textContent = text;
+            messageEl.className = 'reschedule-message show ' + type;
+            setTimeout(() => {
+                messageEl.className = 'reschedule-message';
+            }, 4000);
+        }
+
+        // Calculate Monday of week
+        function getMondayOfWeek(year, month, week) {
+            let startDay;
+            switch(week) {
+                case 1: startDay = 1; break;
+                case 2: startDay = 8; break;
+                case 3: startDay = 15; break;
+                case 4: startDay = 22; break;
+            }
+            
+            // Create date for the start day of the week bucket
+            const date = new Date(year, month - 1, startDay);
+            
+            // Get the day of week (0 = Sunday, 1 = Monday, etc.)
+            const dayOfWeek = date.getDay();
+            
+            // Find the Monday on or after this date
+            // If already Monday (1), use it; otherwise find the next Monday
+            if (dayOfWeek !== 1) {
+                // Calculate days until next Monday
+                const daysUntilMonday = dayOfWeek === 0 ? 1 : (8 - dayOfWeek);
+                date.setDate(date.getDate() + daysUntilMonday);
+            }
+            
+            return date;
+        }
+
+        // Calculate deadline (Sunday after the week's Monday)
+        function getDeadline(mondayDate) {
+            const deadline = new Date(mondayDate);
+            deadline.setDate(deadline.getDate() + 6);
+            return deadline;
+        }
+
+        // Format date as YYYY-MM-DD
+        function formatDate(date) {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        }
+
+        // Open modal
+        function openModal(file) {
+            currentFile = file;
+            modal.classList.add('active');
+        }
+
+        // Close modal
+        function closeModal() {
+            modal.classList.remove('active');
+            currentFile = null;
+        }
+
+        // Handle reschedule
+        async function handleReschedule() {
+            if (!currentFile) return;
+
+            const month = parseInt(monthSelect.value);
+            const week = parseInt(weekSelect.value);
+
+            // Calculate dates
+            const monday = getMondayOfWeek(currentYear, month, week);
+            const deadline = getDeadline(monday);
+            const deadlineStr = formatDate(deadline);
+
+            try {
+                const response = await fetch(window.location.pathname, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: `action=reschedule&file=${encodeURIComponent(currentFile)}&deadline=${encodeURIComponent(deadlineStr)}`
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showMessage('Item rescheduled successfully! Reloading...', 'success');
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 1500);
+                } else {
+                    showMessage('Error: ' + (result.error || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                showMessage('Error: ' + error.message, 'error');
+            }
+
+            closeModal();
+        }
+
+        // Event listeners
+        document.addEventListener('click', (e) => {
+            if (e.target.classList.contains('reschedule-btn')) {
+                const file = e.target.dataset.file;
+                openModal(file);
+            }
+
+            // Close on backdrop click
+            if (e.target === modal) {
+                closeModal();
+            }
+        });
+
+        cancelBtn.addEventListener('click', closeModal);
+        confirmBtn.addEventListener('click', handleReschedule);
+
+        // Close on Escape key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && modal.classList.contains('active')) {
+                closeModal();
+            }
+        });
+    })();
+    </script>
 
 </body>
 
